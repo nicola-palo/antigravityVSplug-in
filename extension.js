@@ -260,11 +260,11 @@ async function launchApp() {
   let exe = findExecutable();
   if (!exe) {
     const pick = await vscode.window.showErrorMessage(
-      'Antigravity non trovato. Vuoi selezionare il percorso dell\'eseguibile?',
-      'Seleziona file...',
-      'Annulla'
+      'Antigravity not found. Would you like to select the executable path?',
+      'Select File...',
+      'Cancel'
     );
-    if (pick === 'Seleziona file...') {
+    if (pick === 'Select File...') {
       exe = await selectExecutablePath();
       if (!exe) return false;
     } else {
@@ -279,11 +279,11 @@ async function launchApp() {
     return true;
   } catch (e) {
     const pick = await vscode.window.showErrorMessage(
-      'Impossibile avviare Antigravity: ' + e.message + '. Il percorso configurato potrebbe essere errato. Vuoi selezionarne un altro?',
-      'Seleziona file...',
-      'Annulla'
+      'Could not start Antigravity: ' + e.message + '. The configured path might be incorrect. Would you like to select another one?',
+      'Select File...',
+      'Cancel'
     );
-    if (pick === 'Seleziona file...') {
+    if (pick === 'Select File...') {
       const newExe = await selectExecutablePath();
       if (newExe) {
         try {
@@ -292,7 +292,7 @@ async function launchApp() {
           await spawnExe(newExe);
           return true;
         } catch (err2) {
-          vscode.window.showErrorMessage('Impossibile avviare Antigravity anche con il nuovo percorso: ' + err2.message);
+          vscode.window.showErrorMessage('Could not start Antigravity even with the new path: ' + err2.message);
           return false;
         }
       }
@@ -649,13 +649,13 @@ function activate(context) {
     vscode.commands.registerCommand('antigravityPanel.openProject', async () => {
       const folder = workspaceFolder();
       if (!folder) {
-        vscode.window.showWarningMessage('Nessuna cartella aperta in questa finestra.');
+        vscode.window.showWarningMessage('No folder is open in this window.');
         return;
       }
       pendingWorkspacePath = folder;
       sendOpenWorkspace(folder);
       if (await launchApp()) {
-        vscode.window.setStatusBarMessage('$(rocket) Progetto inviato ad Antigravity: ' + folder, 5000);
+        vscode.window.setStatusBarMessage('$(rocket) Project sent to Antigravity: ' + folder, 5000);
       }
     }),
 
@@ -664,16 +664,16 @@ function activate(context) {
     }),
 
     vscode.commands.registerCommand('antigravityPanel.configurePath', async () => {
-      const currentPath = vscode.workspace.getConfiguration('antigravityPanel').get('executablePath') || 'Non configurato';
+      const currentPath = vscode.workspace.getConfiguration('antigravityPanel').get('executablePath') || 'Not configured';
       const pick = await vscode.window.showInformationMessage(
-        `Percorso attuale: ${currentPath}\nVuoi selezionare un nuovo percorso per l'eseguibile di Antigravity?`,
-        'Seleziona file...',
-        'Annulla'
+        `Current path: ${currentPath}\nWould you like to select a new path for the Antigravity executable?`,
+        'Select File...',
+        'Cancel'
       );
-      if (pick === 'Seleziona file...') {
+      if (pick === 'Select File...') {
         const newPath = await selectExecutablePath();
         if (newPath) {
-          vscode.window.showInformationMessage(`Percorso di Antigravity aggiornato: ${newPath}`);
+          vscode.window.showInformationMessage(`Antigravity path updated: ${newPath}`);
         }
       }
     }),
@@ -684,11 +684,11 @@ function activate(context) {
     })
   );
 
-  // Voce nella status bar: stato della connessione, clic per aprire la scheda.
+  // Status bar item: connection status, click to open the tab.
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
   status.command = 'antigravityPanel.openTab';
   status.text = '$(rocket) Antigravity';
-  status.tooltip = 'Apri l\'Agent Manager di Antigravity';
+  status.tooltip = 'Open the Antigravity Agent Manager';
   status.show();
   context.subscriptions.push(status);
 
@@ -696,8 +696,8 @@ function activate(context) {
     const server = await discoverServer();
     status.text = server ? '$(rocket) Antigravity ✓' : '$(rocket) Antigravity ○';
     status.tooltip = server
-      ? 'Antigravity connesso (porta ' + server.httpsPort + ') — clicca per aprire l\'Agent Manager'
-      : 'Antigravity non in esecuzione — clicca per aprire il pannello';
+      ? 'Antigravity connected (port ' + server.httpsPort + ') — click to open the Agent Manager'
+      : 'Antigravity not running — click to open the panel';
   }
   refreshStatus();
   const statusTimer = setInterval(refreshStatus, 30000);

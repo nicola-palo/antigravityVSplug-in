@@ -1,8 +1,8 @@
 {
-  "name": "antigravity-panel",
-  "displayName": "Antigravity Panel",
-  "description": "L'Agent Manager di Antigravity dentro VS Code e VSCodium: si collega all'app Antigravity installata, apre la cartella del progetto corrente e include il selettore di modello e thinking nativo.",
-  "version": "0.2.13",
+  "name": "antigravity-vscode-panel",
+  "displayName": "Antigravity Panel (Unofficial)",
+  "description": "Unofficial integration of the Antigravity Agent Manager inside VS Code and VSCodium. Connects to the locally installed Antigravity app.",
+  "version": "0.2.14",
   "publisher": "nicola-palo",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -19,6 +19,14 @@
     "ai"
   ],
   "main": "./extension.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicola-palo/antigravityVSplug-in.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nicola-palo/antigravityVSplug-in/issues"
+  },
+  "homepage": "https://github.com/nicola-palo/antigravityVSplug-in#readme",
   "activationEvents": [
     "onStartupFinished"
   ],
@@ -44,23 +52,23 @@
     "commands": [
       {
         "command": "antigravityPanel.openTab",
-        "title": "Antigravity: Apri Agent Manager in una scheda"
+        "title": "Antigravity: Open Agent Manager in a Tab"
       },
       {
         "command": "antigravityPanel.openProject",
-        "title": "Antigravity: Apri la cartella del progetto in Antigravity"
+        "title": "Antigravity: Open Current Project Folder in Antigravity"
       },
       {
         "command": "antigravityPanel.launchApp",
-        "title": "Antigravity: Avvia l'applicazione"
+        "title": "Antigravity: Launch Application"
       },
       {
         "command": "antigravityPanel.configurePath",
-        "title": "Antigravity: Configura percorso eseguibile"
+        "title": "Antigravity: Configure Executable Path"
       },
       {
         "command": "antigravityPanel.reconnect",
-        "title": "Antigravity: Riconnetti al server"
+        "title": "Antigravity: Reconnect to Server"
       }
     ],
     "configuration": {
@@ -69,17 +77,17 @@
         "antigravityPanel.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Percorso di Antigravity.exe (o Antigravity.app su macOS). Se vuoto, viene cercato nelle posizioni predefinite."
+          "description": "Path to Antigravity.exe (or Antigravity.app on macOS). If empty, looks in default system paths."
         },
         "antigravityPanel.port": {
           "type": "number",
           "default": 0,
-          "description": "Porta HTTP del language server di Antigravity. 0 = rilevamento automatico."
+          "description": "HTTP port of the Antigravity language server. 0 = auto-detect."
         },
         "antigravityPanel.autoLaunch": {
           "type": "boolean",
           "default": false,
-          "description": "Avvia automaticamente l'app Antigravity se non è in esecuzione quando apri il pannello."
+          "description": "Automatically launch the Antigravity app if it is not running when the panel is opened."
         }
       }
     },
@@ -99,7 +107,7 @@
     }
   },
   "scripts": {
-    "package": "vsce package --allow-missing-repository"
+    "package": "vsce package"
   },
   "devDependencies": {
     "@vscode/vsce": "^3.0.0"
