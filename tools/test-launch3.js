@@ -3,7 +3,7 @@
 const cp = require('child_process');
 const path = require('path');
 
-const exe = 'c:\\Users\\nicola.palo\\AppData\\Local\\Programs\\Antigravity\\Antigravity.exe';
+const exe = path.join(process.env.LOCALAPPDATA || 'C:\\Users\\default\\AppData\\Local', 'Programs', 'Antigravity', 'Antigravity.exe');
 const folder = process.argv[3] || null;
 
 function spawnExe(exe, folder) {

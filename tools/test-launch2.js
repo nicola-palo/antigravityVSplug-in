@@ -5,7 +5,7 @@
 const cp = require('child_process');
 const path = require('path');
 
-const exe = 'c:\\Users\\nicola.palo\\AppData\\Local\\Programs\\Antigravity\\Antigravity.exe';
+const exe = path.join(process.env.LOCALAPPDATA || 'C:\\Users\\default\\AppData\\Local', 'Programs', 'Antigravity', 'Antigravity.exe');
 const exeDir = path.dirname(exe);
 const scriptPath = path.join(__dirname, '..', 'launch.ps1');
 const method = process.argv[2] || 'direct';
