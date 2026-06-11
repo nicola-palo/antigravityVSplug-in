@@ -1,0 +1,32 @@
+# Dependency directories
+node_modules/
+
+# Compiled VS Code extension packages
+*.vsix
+
+# VS Code test and local development configs
+.vscode-test/
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/settings.json
+!.vscode/extensions.json
+
+# Local history (VS Code Local History extension)
+.history/
+
+# Log files
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporary and package manager files
+.npm/
+.eslintcache

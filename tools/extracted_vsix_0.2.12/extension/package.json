@@ -1,0 +1,103 @@
+{
+  "name": "antigravity-panel",
+  "displayName": "Antigravity Panel",
+  "description": "L'Agent Manager di Antigravity dentro VS Code e VSCodium: si collega all'app Antigravity installata, apre la cartella del progetto corrente e include il selettore di modello e thinking nativo.",
+  "version": "0.2.12",
+  "publisher": "nicola-palo",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "antigravity",
+    "agent",
+    "gemini",
+    "ai"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "antigravity",
+          "title": "Antigravity",
+          "icon": "media/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "antigravity": [
+        {
+          "type": "webview",
+          "id": "antigravityPanel.view",
+          "name": "Agent Manager"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "antigravityPanel.openTab",
+        "title": "Antigravity: Apri Agent Manager in una scheda"
+      },
+      {
+        "command": "antigravityPanel.launchApp",
+        "title": "Antigravity: Avvia l'applicazione"
+      },
+      {
+        "command": "antigravityPanel.configurePath",
+        "title": "Antigravity: Configura percorso eseguibile"
+      },
+      {
+        "command": "antigravityPanel.reconnect",
+        "title": "Antigravity: Riconnetti al server"
+      }
+    ],
+    "configuration": {
+      "title": "Antigravity Panel",
+      "properties": {
+        "antigravityPanel.executablePath": {
+          "type": "string",
+          "default": "",
+          "description": "Percorso di Antigravity.exe (o Antigravity.app su macOS). Se vuoto, viene cercato nelle posizioni predefinite."
+        },
+        "antigravityPanel.port": {
+          "type": "number",
+          "default": 0,
+          "description": "Porta HTTP del language server di Antigravity. 0 = rilevamento automatico."
+        },
+        "antigravityPanel.autoLaunch": {
+          "type": "boolean",
+          "default": false,
+          "description": "Avvia automaticamente l'app Antigravity se non è in esecuzione quando apri il pannello."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "antigravityPanel.openTab",
+          "when": "view == antigravityPanel.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "antigravityPanel.reconnect",
+          "when": "view == antigravityPanel.view",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "package": "vsce package --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.0.0"
+  }
+}
