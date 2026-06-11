@@ -2,7 +2,7 @@
   "name": "antigravity-vscode-panel",
   "displayName": "Antigravity Panel (Unofficial)",
   "description": "Unofficial integration of the Antigravity Agent Manager inside VS Code and VSCodium. Connects to the locally installed Antigravity app.",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "publisher": "nicola-palo",
   "license": "MIT",
   "icon": "media/icon.png",
