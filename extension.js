@@ -13,6 +13,13 @@ function getOutputChannel() {
   return outputChannel;
 }
 
+// Log diagnostico sul canale "Antigravity Debug".
+function log(msg) {
+  try {
+    getOutputChannel().appendLine(`[${new Date().toISOString()}] ${msg}`);
+  } catch { /* il log non deve mai rompere nulla */ }
+}
+
 // ---------------------------------------------------------------------------
 // Rilevamento del server Antigravity
 // ---------------------------------------------------------------------------
@@ -137,8 +144,21 @@ async function ensureProxy(targetPort) {
     storageFile: path.join(storageDir, 'storage.json'),
     seedFile: process.platform === 'win32'
       ? path.join(process.env.APPDATA || '', 'Antigravity', 'app_storage.json')
-      : path.join(process.env.HOME || '', 'Library', 'Application Support', 'Antigravity', 'app_storage.json')
+      : path.join(process.env.HOME || '', 'Library', 'Application Support', 'Antigravity', 'app_storage.json'),
+    onClosed: () => {
+      if (deactivating) return;
+      // Solo diagnostica + un tentativo di riconnessione: la ricostruzione
+      // vera avviene nei normali cicli connect/refreshStatus.
+      log('ensureProxy: listener chiuso inattesamente, forzo una riconnessione.');
+      setTimeout(() => {
+        try {
+          cachedServer = null;
+          if (viewProvider && viewProvider.wire) viewProvider.wire.reconnect();
+        } catch { /* best effort */ }
+      }, 250);
+    }
   });
+  log(`ensureProxy: attivo su http://127.0.0.1:${proxyInstance.port} -> https://127.0.0.1:${targetPort}`);
   return proxyInstance;
 }
 
@@ -215,8 +235,10 @@ function getCleanEnv() {
   delete env.ATOM_SHELL_INTERNAL_RUN_AS_NODE;
   delete env.NODE_OPTIONS;
   delete env.NODE_PATH;
-  // Forza l'avvio dell'app in modalità headless (background, senza finestra grafica)
-  env.ELECTRON_OZONE_PLATFORM_HINT = 'headless';
+  // NB: dalla 2.11.0 NON forziamo più ELECTRON_OZONE_PLATFORM_HINT=headless:
+  // in headless il language server entra nel flusso "headless auth" e resta
+  // bloccato in attesa di un codice OAuth via stdin, senza finestra per
+  // completarlo (verificato sui log dell'app). Lancio normale, finestrato.
   return env;
 }
 
@@ -232,8 +254,147 @@ function killExistingProcesses() {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Finestra principale (win32): nascondi/mostra senza toccare l'app
+// ---------------------------------------------------------------------------
+
+// Quoting a prova di proiettile: -EncodedCommand (UTF-16LE base64) evita tutti
+// i problemi di escape annidato tra PowerShell, cmd e Node.
+function runPowerShell(script) {
+  const encoded = Buffer.from(script, 'utf16le').toString('base64');
+  return new Promise((resolve, reject) => {
+    cp.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+      { timeout: 10000, windowsHide: true }, (err, stdout, stderr) => {
+        if (err) reject(new Error(String(stderr || err.message || 'errore PowerShell')));
+        else resolve(String(stdout || ''));
+      });
+  });
+}
+
+// Trova la finestra principale dell'app (classe "Chrome_WidgetWin_1") tra i
+// processi Antigravity e applica nCmdShow (0=nascondi, 9=mostra/ripristina,
+// -1=solo report, nessuna azione). Ultima riga stampata: "<trovate> <visibili>"
+// ('NOPROC' se l'app non è in esecuzione).
+function windowsPsScript(nCmdShow, foreground) {
+  const fg = foreground ? '[AGP.W32]::SetForegroundWindow($h) | Out-Null;' : '';
+  const apply = nCmdShow >= 0
+    ? `foreach ($h in $main) { [AGP.W32]::ShowWindow($h, ${nCmdShow}) | Out-Null; ${fg} }`
+    : '';
+  return `Add-Type -Namespace AGP -Name W32 -MemberDefinition '
+[DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lp);
+public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll", CharSet=System.Runtime.InteropServices.CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder sb, int max);
+';
+$pids = @(Get-Process -Name Antigravity -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id);
+if (@($pids).Count -eq 0) { Write-Output 'NOPROC'; exit }
+$main = @();
+$cb = [AGP.W32+EnumWindowsProc]{ param($h,$l)
+  $w = 0;
+  [AGP.W32]::GetWindowThreadProcessId($h, [ref]$w) | Out-Null;
+  if ($pids -contains [int]$w) {
+    $c = New-Object System.Text.StringBuilder 256;
+    [AGP.W32]::GetClassName($h, $c, 256) | Out-Null;
+    if ($c.ToString() -eq 'Chrome_WidgetWin_1') { $script:main += $h }
+  }
+  return $true
+};
+[AGP.W32]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null;
+${apply}
+$vis = 0;
+foreach ($h in $main) { if ([AGP.W32]::IsWindowVisible($h)) { $vis++ } }
+Write-Output ("$($main.Count) $vis");
+`;
+}
+
+// Dopo ogni lancio teniamo sotto controllo la finestra principale per ~20 s:
+// se qualcosa la mostra (aggiornamenti dell'app, second-instance, behavior
+// nuovo), la ri-nascondiamo subito.
+let lastEnforceAt = 0;
+function enforceHiddenWindow() {
+  ensureWindowWatcher();
+}
+
+// ---------------------------------------------------------------------------
+// Watchdog permanente della finestra (win32): un processo PowerShell dedicato
+// che ogni ~700 ms nasconde la finestra principale di Antigravity se risulta
+// visibile. Garantisce che l'app stia SEMPRE nascosta, chiunque la mostri
+// (lancio manuale dell'utente, auto-updater, second-instance...).
+// ---------------------------------------------------------------------------
+
+function watcherPsScript() {
+  return `
+# Watchdog finestra del pannello Antigravity (usato anche come marker processo)
+# AGPANEL_WATCHDOGMARKER
+Add-Type -Namespace AGPW -Name W32 -MemberDefinition '
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+';
+while ($true) {
+  try {
+    # Solo le finestre PRINCIPALI VISIBILI: MainWindowHandle vale 0 per
+    # quelle mai mostrate o nascoste da noi, quindi non tocchiamo altro.
+    Get-Process -Name Antigravity -ErrorAction SilentlyContinue |
+      Where-Object { $_.MainWindowHandle -ne 0 } |
+      ForEach-Object { [AGPW.W32]::ShowWindow($_.MainWindowHandle, 0) | Out-Null }
+  } catch {}
+  Start-Sleep -Milliseconds 700;
+}
+`;
+}
+
+let watchdogChild = null;
+function ensureWindowWatcher() {
+  if (process.platform !== 'win32') return;
+  if (!vscode.workspace.getConfiguration('antigravityPanel').get('hideOnLaunch')) return;
+  // Nascondimento immediato: zappa il flash tipico delle attivazioni
+  // single-instance senza aspettare il primo ciclo del watchdog.
+  runPowerShell(windowsPsScript(0, false)).catch(() => {});
+  startWindowWatcher();
+}
+function startWindowWatcher() {
+  if (process.platform !== 'win32') return;
+  if (watchdogChild && watchdogChild.exitCode === null && !watchdogChild.killed) {
+    const alive = (() => { try { process.kill(watchdogChild.pid, 0); return true; } catch { return false; } })();
+    if (alive) return;
+  }
+  log('watchdog: avvio il watchdog della finestra (nasconde sempre la UI principale).');
+  try {
+    watchdogChild = cp.spawn('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand',
+        Buffer.from(watcherPsScript(), 'utf16le').toString('base64')],
+      { detached: true, stdio: 'ignore', windowsHide: true });
+    watchdogChild.unref();
+  } catch (e) {
+    log('watchdog: avvio fallito: ' + e.message);
+  }
+}
+function stopWindowWatcher() {
+  if (!watchdogChild) return;
+  try { process.kill(watchdogChild.pid); } catch { /* già morto */ }
+  watchdogChild = null;
+  log('watchdog: arrestato.');
+}
+
 function spawnExe(exe) {
   return new Promise((resolve, reject) => {
+    // win32 con "hideOnLaunch": avviamo via PowerShell Start-Process con
+    // -WindowStyle Hidden. L'app gira in modalità normale (autenticazione
+    // intatta, niente --headless né OZONE headless che nella 2.11.0 rompe il
+    // login): semplicemente la finestra principale non viene mai mostrata.
+    if (process.platform === 'win32' && vscode.workspace.getConfiguration('antigravityPanel').get('hideOnLaunch')) {
+      const exeEsc = String(exe).replace(/'/g, "''");
+      const dirEsc = path.dirname(exe).replace(/'/g, "''");
+      const ps =
+        "$env:ELECTRON_RUN_AS_NODE=$null; $env:NODE_OPTIONS=$null; $env:NODE_PATH=$null;\n" +
+        `Start-Process -FilePath '${exeEsc}' -WorkingDirectory '${dirEsc}' -WindowStyle Hidden | Out-Null; Write-Output ok`;
+      runPowerShell(ps)
+        .then(() => { log('spawnExe: app avviata nascosta (-WindowStyle Hidden).'); resolve(true); })
+        .catch((e) => reject(e));
+      return;
+    }
     let child;
     const env = getCleanEnv();
     if (process.platform === 'darwin') {
@@ -256,9 +417,20 @@ function spawnExe(exe) {
   });
 }
 
-async function launchApp() {
+async function launchApp(force) {
+  // Se esiste già un server Antigravity sano, non toccare nulla: killare e
+  // rilanciare distruggerebbe una sessione autenticata (e in 2.11.0 il
+  // rilancio headless non si ri-autentica).
+  if (!force) {
+    const running = await discoverServer();
+    if (running) {
+      log(`launchApp: server già attivo su :${running.httpsPort}, nessun riavvio.`);
+      return true;
+    }
+  }
   let exe = findExecutable();
   if (!exe) {
+    log('launchApp: eseguibile non trovato.');
     const pick = await vscode.window.showErrorMessage(
       'Antigravity not found. Would you like to select the executable path?',
       'Select File...',
@@ -273,9 +445,11 @@ async function launchApp() {
   }
 
   try {
+    log('launchApp: chiudo le istanze precedenti e avvio ' + exe);
     await killExistingProcesses();
     await new Promise((resolve) => setTimeout(resolve, 500));
     await spawnExe(exe);
+    enforceHiddenWindow();
     return true;
   } catch (e) {
     const pick = await vscode.window.showErrorMessage(
@@ -290,6 +464,7 @@ async function launchApp() {
           await killExistingProcesses();
           await new Promise((resolve) => setTimeout(resolve, 500));
           await spawnExe(newExe);
+          enforceHiddenWindow();
           return true;
         } catch (err2) {
           vscode.window.showErrorMessage('Could not start Antigravity even with the new path: ' + err2.message);
@@ -387,7 +562,6 @@ function webviewHtml(opts) {
     <span class="dot" id="dot"></span>
     <span class="spacer"></span>
     <div class="spin" id="spin"></div>
-    ${inTab ? '' : '<button class="btn" id="bTab" title="Apri in una scheda editor (più spazio)">⧉</button>'}
     <button class="btn" id="bReload" title="Ricarica">↻</button>
   </div>
   <iframe id="frame" allow="clipboard-read; clipboard-write; microphone"></iframe>
@@ -412,7 +586,6 @@ function webviewHtml(opts) {
   function send(msg) { vscode.postMessage(msg); }
 
   $('bReload').addEventListener('click', () => { send({ type: 'retry' }); const f = $('frame'); if (f.src) f.src = f.src; });
-  const bTab = $('bTab'); if (bTab) bTab.addEventListener('click', () => send({ type: 'openTab' }));
   $('bLaunch').addEventListener('click', () => { send({ type: 'launch' }); setSearching('Avvio di Antigravity…'); });
   $('bConfigure').addEventListener('click', () => { send({ type: 'configurePath' }); });
   $('bRetry').addEventListener('click', () => { send({ type: 'retry' }); setSearching('Nuova ricerca…'); });
@@ -490,8 +663,10 @@ function wireWebview(webview, context) {
       if (disposed) return;
       if (server) {
         const proxy = await ensureProxy(server.httpsPort);
+        log(`connect: connesso, UI ${proxy.url} (LS v${server.version || '?'})`);
         post({ type: 'state', state: 'connected', url: proxy.url, version: server.version });
       } else {
+        log('connect: nessun server Antigravity trovato.');
         const auto = vscode.workspace.getConfiguration('antigravityPanel').get('autoLaunch');
         if (auto && findExecutable()) {
           await launchApp();
@@ -524,6 +699,7 @@ function wireWebview(webview, context) {
         }
       } else if (Date.now() - start > 90000) {
         clearInterval(pollTimer);
+        log('waitForServer: timeout dopo 90s senza trovare il server.');
         post({ type: 'state', state: 'notfound' });
       }
     }, 2500);
@@ -557,7 +733,7 @@ function wireWebview(webview, context) {
         vscode.commands.executeCommand('antigravityPanel.openProject');
         break;
       case 'consoleLog':
-        getOutputChannel().appendLine(m.message);
+        log(m.message);
         break;
       case 'openTab':
         vscode.commands.executeCommand('antigravityPanel.openTab');
@@ -636,6 +812,8 @@ function openTab(context) {
 
 function activate(context) {
   extensionContext = context;
+  const extVersion = (context.extension && context.extension.packageJSON && context.extension.packageJSON.version) || '?';
+  log(`Attivazione Antigravity Panel v${extVersion}.`);
   viewProvider = new AntigravityViewProvider(context);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider('antigravityPanel.view', viewProvider, {
@@ -663,6 +841,35 @@ function activate(context) {
       await launchApp();
     }),
 
+    vscode.commands.registerCommand('antigravityPanel.showApp', async () => {
+      if (process.platform !== 'win32') return;
+      try {
+        // Sospendiamo il watchdog, altrimenti la ri-nasconde subito.
+        stopWindowWatcher();
+        const out = (await runPowerShell(windowsPsScript(9, true))).trim();
+        if (!out || out === 'NOPROC') {
+          vscode.window.showInformationMessage('Antigravity non è in esecuzione.');
+          return;
+        }
+        const n = parseInt(out.split(/\r?\n/).pop(), 10) || 0;
+        log(`showApp: finestra principale mostrata (${n}), watchdog sospeso.`);
+        vscode.window.setStatusBarMessage('$(rocket) Finestra Antigravity mostrata (watchdog in pausa)', 6000);
+      } catch (e) {
+        vscode.window.showErrorMessage('Antigravity Panel: ' + e.message);
+      }
+    }),
+
+    vscode.commands.registerCommand('antigravityPanel.hideApp', async () => {
+      if (process.platform !== 'win32') return;
+      try {
+        await runPowerShell(windowsPsScript(0, false));
+        startWindowWatcher();
+        vscode.window.setStatusBarMessage('$(rocket) Finestra Antigravity nascosta (watchdog attivo)', 5000);
+      } catch (e) {
+        vscode.window.showErrorMessage('Antigravity Panel: ' + e.message);
+      }
+    }),
+
     vscode.commands.registerCommand('antigravityPanel.configurePath', async () => {
       const currentPath = vscode.workspace.getConfiguration('antigravityPanel').get('executablePath') || 'Not configured';
       const pick = await vscode.window.showInformationMessage(
@@ -680,6 +887,7 @@ function activate(context) {
 
     vscode.commands.registerCommand('antigravityPanel.reconnect', () => {
       cachedServer = null;
+      log('reconnect: cache azzerata, nuova ricerca.');
       if (viewProvider && viewProvider.wire) viewProvider.wire.reconnect();
     })
   );
@@ -694,7 +902,11 @@ function activate(context) {
 
   async function refreshStatus() {
     const server = await discoverServer();
-    status.text = server ? '$(rocket) Antigravity ✓' : '$(rocket) Antigravity ○';
+    const next = server ? '$(rocket) Antigravity ✓' : '$(rocket) Antigravity ○';
+    if (next !== status.text) {
+      log('refreshStatus: ' + (server ? 'connesso su :' + server.httpsPort : 'non in esecuzione'));
+    }
+    status.text = next;
     status.tooltip = server
       ? 'Antigravity connected (port ' + server.httpsPort + ') — click to open the Agent Manager'
       : 'Antigravity not running — click to open the panel';
@@ -702,9 +914,16 @@ function activate(context) {
   refreshStatus();
   const statusTimer = setInterval(refreshStatus, 30000);
   context.subscriptions.push({ dispose: () => clearInterval(statusTimer) });
+
+  // Watchdog: la finestra principale dell'app deve restare sempre nascosta.
+  startWindowWatcher();
 }
 
+let deactivating = false;
+
 function deactivate() {
+  deactivating = true;
+  stopWindowWatcher();
   if (proxyInstance) {
     proxyInstance.close().catch(() => {});
     proxyInstance = null;

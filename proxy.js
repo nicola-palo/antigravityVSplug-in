@@ -10,9 +10,18 @@
 // window.nativeStorage, senza il quale non renderizza nulla): iniettiamo nello
 // HTML uno shim che li fornisce — storage persistito da questo proxy,
 // openExternal/showOpenDialog inoltrati alla webview madre via postMessage.
+//
+// Dalla 2.11.0 la UI costruisce alcuni client gRPC con URL ASSOLUTI verso
+// https://127.0.0.1:<portaLS> invece che relativi alla pagina: nella webview
+// quelle chiamate andrebbero dritte al language server saltando il proxy e
+// fallirebbero (certificato non fidato + CORS). Lo shim patcha quindi
+// window.fetch e window.WebSocket riscrivendo quegli URL sulla propria origine
+// (cioè questo proxy). Per il trasporto WebSocket opzionale
+// (/connect-websocket) qui sotto c'è anche il tunnel degli upgrade.
 
 const http = require('http');
 const https = require('https');
+const tls = require('tls');
 const fs = require('fs');
 const path = require('path');
 
@@ -20,6 +29,88 @@ function buildShim() {
   return `<script>(function () {
   if (window.nativeStorage) return; // dentro l'app Electron vera: non serve nulla
 
+  // --- Diagnostica: errori runtime verso la webview madre -------------------
+  function fmt(v) {
+    try {
+      if (v instanceof Error) return v.stack || v.message;
+      if (typeof v === 'object' && v !== null) return JSON.stringify(v).substring(0, 500);
+      return String(v);
+    } catch (e) { return String(v); }
+  }
+  function post(type, data) {
+    try {
+      if (window.parent !== window) {
+        var m = { __agpanel: true, type: type };
+        if (data) { for (var k in data) m[k] = data[k]; }
+        window.parent.postMessage(m, '*');
+      }
+    } catch (e) {}
+  }
+  function log(msg) { post('console-log', { message: msg }); }
+
+  window.addEventListener('error', function (ev) {
+    log('[runtime error] ' + (ev.message || fmt(ev.error)) +
+      (ev.filename ? (' @' + ev.filename + ':' + ev.lineno + ':' + ev.colno) : ''));
+  });
+  window.addEventListener('unhandledrejection', function (ev) {
+    log('[unhandled rejection] ' + fmt(ev.reason));
+  });
+  ['error', 'warn'].forEach(function (level) {
+    var original = console[level].bind(console);
+    console[level] = function () {
+      try { log('console.' + level + ': ' + [].slice.call(arguments).map(fmt).join(' ')); } catch (e) {}
+      original.apply(null, arguments);
+    };
+  });
+
+  // --- Bridge di rete (2.11.0+): URL assoluti -> questa origine -------------
+  // La UI usa baseUrl assoluti tipo "https://127.0.0.1:<portaLS>"; li
+  // riscriviamo sul percorso relativo così le chiamate passano da qui.
+  var ABS_HOST_RE = /^https?:\\/\\/(?:127\\.0\\.0\\.1|localhost|\\[::1\\])(?::\\d+)?(?=\\/|$)/i;
+  function rewriteHttpUrl(raw) {
+    var m = ABS_HOST_RE.exec(String(raw || ''));
+    if (!m) return raw;
+    var rest = String(raw).slice(m[0].length);
+    return rest && rest.charAt(0) === '/' ? rest : '/';
+  }
+  var origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    try {
+      var url = null;
+      if (typeof input === 'string' || input instanceof URL) url = String(input);
+      else if (input && input.url) url = input.url;
+      if (url) {
+        var rel = rewriteHttpUrl(url);
+        if (rel !== url) {
+          if (typeof input === 'string' || input instanceof URL) {
+            return origFetch(rel, init);
+          }
+          try { return origFetch(new Request(rel, input), init); } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    return origFetch(input, init);
+  };
+  var WS_RE = /^(wss?):\\/\\/(?:127\\.0\\.0\\.1|localhost|\\[::1\\]):?\\d*(\\/[^?#]*)(?:[?#].*)?$/i;
+  function rewriteWsUrl(raw) {
+    var m = WS_RE.exec(String(raw || ''));
+    if (!m) return String(raw || '');
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return proto + '\\/\\/' + location.host + m[2];
+  }
+  var OrigWS = window.WebSocket;
+  function PatchedWebSocket(url, protocols) {
+    return protocols !== undefined
+      ? new OrigWS(rewriteWsUrl(url), protocols)
+      : new OrigWS(rewriteWsUrl(url));
+  }
+  PatchedWebSocket.prototype = OrigWS.prototype;
+  ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(function (k) {
+    try { PatchedWebSocket[k] = OrigWS[k]; } catch (e) {}
+  });
+  window.WebSocket = PatchedWebSocket;
+
+  // --- RPC di servizio e bridge nativi ---------------------------------------
   function rpc(p, body) {
     return fetch('/__agpanel/' + p, {
       method: 'POST',
@@ -30,18 +121,6 @@ function buildShim() {
 
   // Canale richiesta/risposta con la webview che ci incornicia.
   var reqId = 0, pending = {};
-  function post(type, data) {
-    try {
-      if (window.parent !== window) {
-        var m = { __agpanel: true, type: type };
-        for (var k in data) m[k] = data[k];
-        window.parent.postMessage(m, '*');
-      }
-    } catch (e) { /* niente parent: ambiente di test */ }
-  }
-  function log(msg) {
-    post('console-log', { message: msg });
-  }
   function parentRequest(type, data) {
     if (window.parent === window) return Promise.resolve(undefined);
     return new Promise(function (resolve) {
@@ -151,6 +230,9 @@ function buildShim() {
   };
   window.electronUpdater = {
     onStateChanged: function () { return function () {}; },
+    // Richiesto dalla 2.11.0 all'avvio (R0b): senza getState() la UI esce con
+    // "TypeError: a.getState is not a function" e non monta nulla.
+    getState: function () { return Promise.resolve({ type: 'disabled' }); },
     applyUpdate: function () { return Promise.resolve(); },
     quitAndInstall: function () { return Promise.resolve(); },
     checkForUpdates: function () { return Promise.resolve(); }
@@ -158,6 +240,17 @@ function buildShim() {
   window.deepLink = {
     onDeepLink: function () { return function () {}; },
     getStoredDeepLink: function () { return Promise.resolve(null); }
+  };
+  window.wizardAPI = {
+    // Nomi reali del preload 2.11.0 (wizard:complete / wizard:setup-complete).
+    completeWizard: function () { return Promise.resolve(); },
+    onSetupComplete: function () { return function () {}; }
+  };
+  window.__electronLog = {
+    send: function () {},
+    info: function () {}, warn: function () {}, error: function () {},
+    handle: function () { return function () {}; },
+    toIpcRenderer: function () { return null; }
   };
   window.agent = { updateActiveAgentCount: function () { return Promise.resolve(); } };
   window.ide = { isInstalled: function () { return Promise.resolve(true); } };
@@ -172,6 +265,9 @@ function buildShim() {
         return Promise.resolve(p);
       }
       return parentRequest('open-dialog', {});
+    },
+    showOpenMultipleFolderDialog: function () {
+      return this.showOpenDialog().then(function (p) { return p ? [p] : []; });
     }
   };
 })();</script>`;
@@ -179,6 +275,56 @@ function buildShim() {
 
 // Header hop-by-hop da non inoltrare mai.
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade'];
+
+// La UI carica font (icone Material Symbols, Google Sans) dagli host Google.
+// Dalla webview quelle richieste possono fallire (rete dell'editor); le
+// riscriviamo su questo proxy che le esegue noi server-side.
+const EXTERNAL_HOST_RE = /https?:\/\/((?:[a-z0-9-]+\.)*(?:gstatic\.com|googleapis\.com))(\/[^"'\s\\)]*)?/gi;
+const TEXTUAL_TYPES = /text\/html|text\/css|javascript|ecmascript/i;
+
+function rewriteExternalHosts(str) {
+  return str.replace(EXTERNAL_HOST_RE, '/__agpanel/ext/$1$2');
+}
+
+function handleExternalFetch(req, res) {
+  // URL: /__agpanel/ext/<host>/<path>?<query>
+  const m = /^\/__agpanel\/ext\/([^/?#]+)(\/[^#]*)?(?:\?.*)?$/.exec(req.url);
+  if (!m) { res.writeHead(400); res.end(); return; }
+  const host = m[1].toLowerCase();
+  if (!/(^|\.)gstatic\.com$|(^|\.)googleapis\.com$/.test(host)) {
+    res.writeHead(403); res.end('host non consentito'); return;
+  }
+  const qIndex = req.url.indexOf('?');
+  const query = qIndex >= 0 ? req.url.slice(qIndex) : '';
+  const upstreamPath = (m[2] || '/') + query;
+  const headers = {};
+  for (const k of ['accept', 'accept-language', 'range', 'origin', 'referer']) {
+    if (req.headers[k]) headers[k] = req.headers[k];
+  }
+  headers['user-agent'] = req.headers['user-agent'] || 'Mozilla/5.0 AntigravityPanel';
+  if (headers.origin && host.includes('googleapis')) headers.origin = `https://${host}`;
+  headers.host = host;
+
+  const upReq = https.request({ host, path: upstreamPath, method: req.method, headers }, (ur) => {
+    // Pipe binario fedele: preserviamo content-encoding così com'è.
+    const out = {};
+    for (const [k, v] of Object.entries(ur.headers)) {
+      if (!HOP_BY_HOP.includes(k.toLowerCase())) out[k] = v;
+    }
+    out['access-control-allow-origin'] = '*';
+    res.writeHead(ur.statusCode, out);
+    ur.pipe(res);
+  });
+  upReq.on('error', (e) => {
+    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
+    res.end('ext fetch error: ' + e.message);
+  });
+  if (req.method === 'POST' || req.method === 'PUT') {
+    req.pipe(upReq);
+  } else {
+    upReq.end();
+  }
+}
 
 function createProxy(options) {
   const targetPort = options.targetPort;
@@ -209,7 +355,26 @@ function createProxy(options) {
     return items;
   }
 
+  function upstreamHeaders(reqHeaders) {
+    const headers = {};
+    for (const [k, v] of Object.entries(reqHeaders)) {
+      if (!HOP_BY_HOP.includes(k.toLowerCase())) headers[k.toLowerCase()] = v;
+    }
+    headers.host = `127.0.0.1:${targetPort}`;
+    // Il server applica controlli CSRF basati su Origin: presentiamo la sua.
+    if (headers.origin) headers.origin = targetOrigin;
+    if (headers.referer) {
+      try { headers.referer = targetOrigin + new URL(headers.referer).pathname; } catch { delete headers.referer; }
+    }
+    return headers;
+  }
+
   const server = http.createServer((req, res) => {
+    // Rilancio dei font/risorse Google scaricati server-side.
+    if (req.url.startsWith('/__agpanel/ext/')) {
+      handleExternalFetch(req, res);
+      return;
+    }
     // Endpoint interni dello shim.
     if (req.url.startsWith('/__agpanel/')) {
       let body = '';
@@ -241,16 +406,7 @@ function createProxy(options) {
       return;
     }
 
-    const headers = {};
-    for (const [k, v] of Object.entries(req.headers)) {
-      if (!HOP_BY_HOP.includes(k.toLowerCase())) headers[k] = v;
-    }
-    headers.host = `127.0.0.1:${targetPort}`;
-    // Il server applica controlli CSRF basati su Origin: presentiamo la sua.
-    if (headers.origin) headers.origin = targetOrigin;
-    if (headers.referer) {
-      try { headers.referer = targetOrigin + new URL(headers.referer).pathname; } catch { delete headers.referer; }
-    }
+    const headers = upstreamHeaders(req.headers);
     delete headers['accept-encoding']; // risposta non compressa, così possiamo iniettare
 
     const upstream = https.request({
@@ -269,25 +425,43 @@ function createProxy(options) {
         outHeaders['set-cookie'] = outHeaders['set-cookie'].map((c) => c.replace(/;\s*Secure/gi, ''));
       }
       const isHtml = String(ur.headers['content-type'] || '').includes('text/html');
-      if (!isHtml) {
+      const isTextual = isHtml || TEXTUAL_TYPES.test(String(ur.headers['content-type'] || ''));
+      if (!isTextual) {
+        // Header-only: solo charset esplicito per JSON/testo, byte intatti.
+        const ct0 = String(ur.headers['content-type'] || '');
+        if (ct0 && /json|text\//i.test(ct0) && !/charset=/i.test(ct0)) {
+          outHeaders['content-type'] = ct0.replace(/;\s*$/, '') + '; charset=UTF-8';
+        }
         res.writeHead(ur.statusCode, outHeaders);
         ur.pipe(res);
         return;
       }
-      // HTML (la shell della SPA, ~2 KB): bufferizza e inietta lo shim in testa.
+      // HTML/CSS/JS della shell: bufferizziamo per riscrivere gli URL esterni
+      // e (solo HTML) iniettare lo shim in testa.
       const chunks = [];
       ur.on('data', (c) => chunks.push(c));
       ur.on('end', () => {
-        let html = Buffer.concat(chunks).toString('utf8');
-        const at = html.search(/<head[^>]*>/i);
-        if (at !== -1) {
-          const end = html.indexOf('>', at) + 1;
-          html = html.slice(0, end) + shim + html.slice(end);
-        } else {
-          html = shim + html;
+        let buf = Buffer.concat(chunks);
+        let str = buf.toString('utf8');
+        str = rewriteExternalHosts(str);
+        if (isHtml) {
+          const at = str.search(/<head[^>]*>/i);
+          if (at !== -1) {
+            const end = str.indexOf('>', at) + 1;
+            str = str.slice(0, end) + shim + str.slice(end);
+          } else {
+            str = shim + str;
+          }
         }
-        const buf = Buffer.from(html, 'utf8');
+        buf = Buffer.from(str, 'utf8');
         outHeaders['content-length'] = String(buf.length);
+        // Encoding esplicito: senza charset il renderer può interpretare i
+        // caratteri-icona (Material Symbols / PUA) come Windows-1252 e
+        // mostrarli come mojibake (⧉, ↻...).
+        const ct = String(outHeaders['content-type'] || '');
+        if (ct && !/charset=/i.test(ct)) {
+          outHeaders['content-type'] = ct.replace(/;\s*$/, '') + '; charset=UTF-8';
+        }
         res.writeHead(ur.statusCode, outHeaders);
         res.end(buf);
       });
@@ -299,8 +473,66 @@ function createProxy(options) {
     req.pipe(upstream);
   });
 
+  // Tunnel WebSocket (es. /connect-websocket): ricevuto l'upgrade dal browser,
+  // apriamo una connessione TLS al language server, gli giriamo la richiesta
+  // di upgrade con Host/Origin riscritti e poi incanalamo i byte in entrambe
+  // le direzioni.
+  server.on('upgrade', (req, clientSocket, head) => {
+    const headers = upstreamHeaders(req.headers);
+    // Hop-by-hop via HOP_BY_HOP già scartati; per l'upgrade servono questi:
+    headers.connection = 'Upgrade';
+    headers.upgrade = req.headers.upgrade || 'websocket';
+
+    const requestLines = [`${req.method} ${req.url} HTTP/1.1`];
+    for (const [k, v] of Object.entries(headers)) requestLines.push(`${k}: ${v}`);
+    const requestText = requestLines.join('\r\n') + '\r\n\r\n';
+
+    const ups = tls.connect({
+      host: '127.0.0.1',
+      port: targetPort,
+      rejectUnauthorized: false,
+      servername: '127.0.0.1'
+    }, () => {
+      ups.write(requestText);
+      if (head && head.length) ups.write(head);
+    });
+
+    let switched = false;
+    ups.on('data', (chunk) => {
+      if (switched) return;
+      switched = true;
+      const txt = chunk.toString('latin1');
+      const idx = txt.indexOf('\r\n\r\n');
+      if (idx === -1 || !/^HTTP\/1\.1 101/i.test(txt)) {
+        // Upstream ha rifiutato l'upgrade: inoltra la risposta e chiudi.
+        clientSocket.write(chunk);
+        clientSocket.destroy();
+        ups.destroy();
+        return;
+      }
+      clientSocket.write(chunk.slice(0, idx + 4));
+      if (chunk.length > idx + 4) ups.unshift(chunk.slice(idx + 4));
+      ups.pipe(clientSocket);
+      clientSocket.pipe(ups);
+    });
+
+    const cleanup = () => {
+      try { clientSocket.destroy(); } catch { /* ignora */ }
+      try { ups.destroy(); } catch { /* ignora */ }
+    };
+    ups.on('error', cleanup);
+    clientSocket.on('error', cleanup);
+    clientSocket.on('close', cleanup);
+    ups.on('close', cleanup);
+  });
+
   return new Promise((resolve, reject) => {
     server.on('error', reject);
+    server.on('close', () => {
+      // Diagnostica: ci serve sapere se/il perché il listener muore mentre
+      // l'estensione è ancora viva (refuso o shutdown anomalo dell'host).
+      try { options.onClosed && options.onClosed(); } catch { /* mai bloccare */ }
+    });
     server.listen(options.localPort || 0, '127.0.0.1', () => {
       resolve({
         port: server.address().port,
